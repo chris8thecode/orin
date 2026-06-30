@@ -1,0 +1,14 @@
+# Deps
+node_modules
+bun.lock
+
+# Logs
+logs
+
+# Database
+orin.db
+orin.db-shm
+orin.db-wal
+
+# Env
+.env
