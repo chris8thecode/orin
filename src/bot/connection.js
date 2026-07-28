@@ -63,12 +63,12 @@ export async function createBotSession(
   const orin = makeWASocket({
     version,
     browser: Browsers.windows('Chrome'),
-    connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 30000,
+    connectTimeoutMs: 45000,
+    keepAliveIntervalMs: 25000,
     logger: baileysLogger,
     defaultQueryTimeoutMs: 60000,
-    retryRequestDelayMs: 300,
-    maxMsgRetryCount: 10,
+    retryRequestDelayMs: 200,
+    maxMsgRetryCount: 3,
     emitOwnEvents: true,
     fireInitQueries: true,
     auth: {
