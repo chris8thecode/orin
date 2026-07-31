@@ -4,6 +4,9 @@ import makeWASocket, {
   useMultiFileAuthState,
   makeCacheableSignalKeyStore,
   fetchLatestBaileysVersion,
+  isJidStatusBroadcast,
+  getContentType,
+  downloadContentFromMessage,
 } from 'baileys';
 import P from 'pino';
 import { join } from 'path';
@@ -13,13 +16,23 @@ import {
   updateConnectionStatus,
   incrementDailyConnections,
   getActiveConnections,
+  storeMessage,
+  markMessageDeleted,
+  getStoredMessage,
+  getRecentChats,
+  getRecentMessages,
 } from '../database/queries.js';
-import { handleMessage, setupGroupCacheListeners } from './messageHandler.js';
+import {
+  handleMessage,
+  setupGroupCacheListeners,
+  getGroupName,
+  setGroupCache,
+} from './messageHandler.js';
 import { logger } from '../logger.js';
 import { updateEnvFile } from '../utils/env.js';
 import { config } from '../config.js';
 import { extractId } from '../utils/helpers.js';
-import { broadcastStats } from '../server/websocket.js';
+import { broadcastStats, broadcastChatEvent } from '../server/websocket.js';
 
 const baileysLogger = logger.child({ component: 'baileys' });
 baileysLogger.level = 'trace';
@@ -34,17 +47,73 @@ export function getActiveSessions() {
   return activeSessions;
 }
 
-/**
- * Creates and initializes a new WhatsApp bot session.
- *
- * @param {string} phoneNumber
- * @param {string} sessionId
- * @param {function(string): void} [onPairingCode]
- * @param {function(string): void} [onConnected]
- * @param {function(string): void} [onDisconnected]
- * @param {string|null} [existingFolder]
- * @returns {Promise<any>}
- */
+function extractText(message) {
+  return (
+    message?.conversation ||
+    message?.extendedTextMessage?.text ||
+    message?.imageMessage?.caption ||
+    message?.videoMessage?.caption ||
+    message?.documentMessage?.caption ||
+    null
+  );
+}
+
+function extractMediaInfo(message) {
+  const type = getContentType(message);
+  if (!type || type === 'conversation' || type === 'extendedTextMessage') return null;
+
+  const media = message[type];
+  if (!media) return null;
+
+  const mediaTypes = [
+    'imageMessage',
+    'videoMessage',
+    'audioMessage',
+    'documentMessage',
+    'stickerMessage',
+  ];
+
+  if (!mediaTypes.includes(type)) return null;
+
+  return {
+    mediaType: type.replace('Message', ''),
+    mediaKey: media.mediaKey ? Buffer.from(media.mediaKey).toString('base64') : null,
+    directPath: media.directPath ?? null,
+    mimeType: media.mimetype ?? null,
+    fileName: media.fileName ?? null,
+  };
+}
+
+function buildMessagePayload(msg, sessionPhone) {
+  const remoteJid = msg.key.remoteJid;
+  const participant = msg.key.participant ?? null;
+  const fromMe = msg.key.fromMe ?? false;
+  const messageId = msg.key.id;
+  const timestamp =
+    typeof msg.messageTimestamp === 'object'
+      ? Number(msg.messageTimestamp)
+      : (msg.messageTimestamp ?? Date.now() / 1000);
+
+  const text = extractText(msg.message);
+  const media = extractMediaInfo(msg.message);
+
+  const isGroup = remoteJid?.endsWith('@g.us') ?? false;
+  const groupName = isGroup ? getGroupName(remoteJid) : null;
+
+  return {
+    messageId,
+    sessionPhone,
+    remoteJid,
+    participant,
+    fromMe,
+    textContent: text,
+    timestamp: timestamp * 1000,
+    pushName: msg.pushName ?? null,
+    groupName,
+    ...(media ?? {}),
+  };
+}
+
 export async function createBotSession(
   phoneNumber,
   sessionId,
@@ -52,6 +121,7 @@ export async function createBotSession(
   onConnected = () => {},
   onDisconnected = () => {},
   existingFolder = null,
+  server = null,
 ) {
   const sessionFolder = existingFolder || join(process.cwd(), 'sessions', sessionId);
 
@@ -97,7 +167,13 @@ export async function createBotSession(
     msgRetryCounterCache,
     userDevicesCache,
     mediaCache,
-    getMessage: async () => undefined,
+    getMessage: async (key) => {
+      const stored = getStoredMessage(key.id);
+      if (stored?.text_content) {
+        return { conversation: stored.text_content };
+      }
+      return undefined;
+    },
   });
 
   if (!orin.authState.creds.registered) {
@@ -118,28 +194,27 @@ export async function createBotSession(
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode;
 
-      /*
-       * If the disconnect was NOT caused by an explicit logout (e.g., connection timed out or dropped),
-       * we schedule an automatic reconnection. Explicit logouts should not auto-reconnect to prevent
-       * infinite looping with invalid credentials.
-       */
       if (reason !== DisconnectReason.loggedOut) {
         setTimeout(() => {
-          createBotSession(phoneNumber, sessionId, onPairingCode, onConnected, onDisconnected);
+          createBotSession(
+            phoneNumber,
+            sessionId,
+            onPairingCode,
+            onConnected,
+            onDisconnected,
+            null,
+            server,
+          );
         }, 5000);
       } else {
         activeSessions.delete(sessionId);
         updateConnectionStatus(phoneNumber, false);
         onDisconnected('Logged out');
-        broadcastStats();
+        broadcastStats(server);
       }
     } else if (connection === 'open') {
       const connectedNumber = extractId(orin.user?.id);
 
-      /*
-       * Business Rule: The very first phone number that successfully connects to the bot
-       * is automatically promoted to the owner, bypassing the need for manual configuration.
-       */
       if (!config.ownerNumber) {
         updateEnvFile('OWNER_NUMBER', connectedNumber);
       }
@@ -149,18 +224,81 @@ export async function createBotSession(
       incrementDailyConnections();
       setupGroupCacheListeners(orin);
       onConnected(connectedNumber);
-      broadcastStats();
+      broadcastStats(server);
+
+      if (server) {
+        const chats = getRecentChats(connectedNumber);
+        broadcastChatEvent(server, connectedNumber, { type: 'chats', data: chats });
+      }
     }
   });
 
   orin.ev.on('creds.update', saveCreds);
 
   orin.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    for (const msg of messages) {
+      if (!msg.message) continue;
 
-    for (const message of messages) {
-      await handleMessage(orin, message);
+      const sessionPhone = extractId(orin.user?.id);
+      const payload = buildMessagePayload(msg, sessionPhone);
+      storeMessage(payload);
+
+      if (server) {
+        broadcastChatEvent(server, sessionPhone, {
+          type: 'message',
+          data: {
+            ...payload,
+            isDeleted: false,
+          },
+        });
+      }
+
+      if (type !== 'notify') continue;
+      await handleMessage(orin, msg);
     }
+  });
+
+  orin.ev.on('messages.update', (updates) => {
+    const sessionPhone = extractId(orin.user?.id);
+
+    for (const update of updates) {
+      if (update.update?.messageStubType || update.update?.status === 6) {
+        markMessageDeleted(update.key.id);
+
+        if (server) {
+          broadcastChatEvent(server, sessionPhone, {
+            type: 'message_deleted',
+            data: { messageId: update.key.id, remoteJid: update.key.remoteJid },
+          });
+        }
+      }
+    }
+  });
+
+  orin.ev.on('message-receipt.update', (receipts) => {
+    const sessionPhone = extractId(orin.user?.id);
+    if (!server) return;
+
+    for (const receipt of receipts) {
+      broadcastChatEvent(server, sessionPhone, {
+        type: 'receipt',
+        data: {
+          messageId: receipt.key.id,
+          remoteJid: receipt.key.remoteJid,
+          status: receipt.update.status,
+        },
+      });
+    }
+  });
+
+  orin.ev.on('presence.update', ({ id, presences }) => {
+    const sessionPhone = extractId(orin.user?.id);
+    if (!server) return;
+
+    broadcastChatEvent(server, sessionPhone, {
+      type: 'presence',
+      data: { jid: id, presences },
+    });
   });
 
   return orin;
@@ -171,11 +309,40 @@ export function disconnectSession(sessionId) {
   if (session) {
     session.orin.logout();
     activeSessions.delete(sessionId);
-    broadcastStats();
   }
 }
 
-export async function resumeSessions() {
+export async function sendMessageFromUI(sessionPhone, remoteJid, text) {
+  for (const [, session] of activeSessions) {
+    if (session.phoneNumber === sessionPhone) {
+      await session.orin.sendMessage(remoteJid, { text });
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function fetchMediaFromUI(sessionPhone, messageId) {
+  const stored = getStoredMessage(messageId);
+  if (!stored || !stored.media_type || !stored.media_key || !stored.direct_path) return null;
+
+  for (const [, session] of activeSessions) {
+    if (session.phoneNumber === sessionPhone) {
+      const stream = await downloadContentFromMessage(
+        {
+          mediaKey: Buffer.from(stored.media_key, 'base64'),
+          directPath: stored.direct_path,
+          url: null,
+        },
+        stored.media_type,
+      );
+      return stream;
+    }
+  }
+  return null;
+}
+
+export async function resumeSessions(server = null) {
   const activeConnections = getActiveConnections();
   logger.info(`Resuming ${activeConnections.length} session(s)...`);
 
@@ -189,6 +356,7 @@ export async function resumeSessions() {
         (num) => logger.info(`Session resumed for ${num}`),
         (err) => logger.warn(`Session failed for ${conn.phone_number}: ${err}`),
         conn.session_folder,
+        server,
       );
     } catch (error) {
       logger.error({ error, phoneNumber: conn.phone_number }, 'Failed to resume session');

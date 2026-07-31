@@ -4,8 +4,16 @@ import {
   getConnectionStats,
   getAllPasskeys,
   getValidPasskeys,
+  getRecentChats,
+  getRecentMessages,
 } from '../database/queries.js';
-import { createBotSession, disconnectSession, getActiveSessions } from '../bot/connection.js';
+import {
+  createBotSession,
+  disconnectSession,
+  getActiveSessions,
+  sendMessageFromUI,
+  fetchMediaFromUI,
+} from '../bot/connection.js';
 import { createPasskeyWithExpiry, validatePasskey } from '../utils/crypto.js';
 import { config } from '../config.js';
 import { formatNumber } from '../utils/helpers.js';
@@ -23,8 +31,18 @@ export function createWebSocketHandler() {
     close(ws) {
       logger.info('Dashboard WebSocket client disconnected');
     },
-    message(ws, message) {
-      logger.debug(`WebSocket message: ${message}`);
+    message(ws, raw) {
+      try {
+        const msg = JSON.parse(raw);
+        if (msg.type === 'subscribe_chat' && msg.sessionPhone) {
+          ws.subscribe(`chat:${msg.sessionPhone}`);
+        }
+        if (msg.type === 'unsubscribe_chat' && msg.sessionPhone) {
+          ws.unsubscribe(`chat:${msg.sessionPhone}`);
+        }
+      } catch {
+        logger.debug('Unparseable WS message');
+      }
     },
   };
 }
@@ -45,6 +63,7 @@ function sendStatsToClient(ws) {
 }
 
 export function broadcastStats(server) {
+  if (!server) return;
   const stats = getConnectionStats();
   const activeSessions = getActiveSessions();
   const activeConnections = Array.from(activeSessions.values()).map((s) => ({
@@ -59,7 +78,13 @@ export function broadcastStats(server) {
   server.publish('dashboard-stats', message);
 }
 
+export function broadcastChatEvent(server, sessionPhone, payload) {
+  if (!server) return;
+  server.publish(`chat:${sessionPhone}`, JSON.stringify(payload));
+}
+
 export function notifyNewConnection(server, phoneNumber) {
+  if (!server) return;
   const message = JSON.stringify({
     type: 'newConnection',
     data: { phoneNumber },
@@ -76,13 +101,13 @@ async function parseJSON(req) {
   }
 }
 
-export function createRoutes(publicDir) {
-  return async (req, server) => {
+export function createRoutes(publicDir, server) {
+  return async (req, serverInstance) => {
     const url = new URL(req.url);
     const pathname = url.pathname;
 
     if (pathname === '/ws') {
-      if (server.upgrade(req)) {
+      if (serverInstance.upgrade(req)) {
         return;
       }
       return Response.json({ error: 'WebSocket upgrade failed' }, { status: 400 });
@@ -135,8 +160,8 @@ export function createRoutes(publicDir) {
               }
             },
             (connectedNumber) => {
-              notifyNewConnection(server, connectedNumber);
-              broadcastStats(server);
+              notifyNewConnection(serverInstance, connectedNumber);
+              broadcastStats(serverInstance);
             },
             (reason) => {
               const pending = pendingConnections.get(sessionId);
@@ -145,6 +170,8 @@ export function createRoutes(publicDir) {
                 pending.reject(new Error(reason));
               }
             },
+            null,
+            serverInstance,
           );
         });
 
@@ -154,11 +181,62 @@ export function createRoutes(publicDir) {
           success: true,
           pairingCode,
           sessionId,
-          message: 'Enter this code in WhatsApp > Check For Pairing Code Notification',
+          message: 'Enter this code in WhatsApp',
         });
       } catch (error) {
         pendingConnections.delete(sessionId);
         return Response.json({ error: error.message }, { status: 500 });
+      }
+    }
+
+    if (pathname === '/api/chats' && req.method === 'GET') {
+      const sessionPhone = url.searchParams.get('session');
+      if (!sessionPhone) {
+        return Response.json({ error: 'session param required' }, { status: 400 });
+      }
+      const chats = getRecentChats(sessionPhone);
+      return Response.json({ chats });
+    }
+
+    if (pathname === '/api/messages' && req.method === 'GET') {
+      const sessionPhone = url.searchParams.get('session');
+      const jid = url.searchParams.get('jid');
+      if (!sessionPhone || !jid) {
+        return Response.json({ error: 'session and jid params required' }, { status: 400 });
+      }
+      const messages = getRecentMessages(sessionPhone, jid);
+      return Response.json({ messages });
+    }
+
+    if (pathname === '/api/send' && req.method === 'POST') {
+      const body = await parseJSON(req);
+      if (!body?.sessionPhone || !body?.remoteJid || !body?.text) {
+        return Response.json({ error: 'sessionPhone, remoteJid, text required' }, { status: 400 });
+      }
+      const sent = await sendMessageFromUI(body.sessionPhone, body.remoteJid, body.text);
+      if (!sent) {
+        return Response.json({ error: 'Session not found or not connected' }, { status: 404 });
+      }
+      return Response.json({ success: true });
+    }
+
+    if (pathname === '/api/media' && req.method === 'GET') {
+      const sessionPhone = url.searchParams.get('session');
+      const messageId = url.searchParams.get('id');
+      if (!sessionPhone || !messageId) {
+        return Response.json({ error: 'session and id params required' }, { status: 400 });
+      }
+
+      try {
+        const stream = await fetchMediaFromUI(sessionPhone, messageId);
+        if (!stream) {
+          return Response.json({ error: 'Media not found' }, { status: 404 });
+        }
+        return new Response(stream, {
+          headers: { 'Content-Type': 'application/octet-stream' },
+        });
+      } catch {
+        return Response.json({ error: 'Media fetch failed' }, { status: 500 });
       }
     }
 
@@ -236,6 +314,10 @@ export function createRoutes(publicDir) {
 
     if (pathname === '/admin') {
       return new Response(Bun.file(`${publicDir}/admin.html`));
+    }
+
+    if (pathname === '/chat') {
+      return new Response(Bun.file(`${publicDir}/chat.html`));
     }
 
     const filePath = `${publicDir}${pathname}`;

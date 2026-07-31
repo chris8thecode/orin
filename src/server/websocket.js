@@ -1,1 +1,6 @@
-export { createWebSocketHandler, broadcastStats, notifyNewConnection } from './routes.js';
+export {
+  createWebSocketHandler,
+  broadcastStats,
+  broadcastChatEvent,
+  notifyNewConnection,
+} from './routes.js';

@@ -76,6 +76,15 @@ export async function handleMessage(orin, message) {
   }
 }
 
+export function getGroupName(jid) {
+  const cached = groupCache.get(jid);
+  return cached?.subject ?? null;
+}
+
+export function setGroupCache(jid, metadata) {
+  groupCache.set(jid, metadata);
+}
+
 export function setupGroupCacheListeners(orin) {
   orin.ev.on('groups.update', async ([event]) => {
     try {

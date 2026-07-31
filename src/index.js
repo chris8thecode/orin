@@ -10,8 +10,8 @@ logger.info(`Prefix: ${config.prefix}`);
 logger.info(`Owner Number: ${config.ownerNumber}`);
 logger.info(`Admin Contact: ${config.adminContact}`);
 
-startServer();
-resumeSessions();
+const server = startServer();
+resumeSessions(server);
 
 process.on('SIGINT', () => {
   logger.info('Shutting down Orin');

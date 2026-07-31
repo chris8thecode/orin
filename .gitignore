@@ -10,5 +10,8 @@ orin.db
 orin.db-shm
 orin.db-wal
 
+# Session
+sessions
+
 # Env
 .env

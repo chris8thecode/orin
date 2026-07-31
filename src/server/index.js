@@ -27,6 +27,7 @@ export function startServer() {
       logger.info(`Orin Server running on http://localhost:${server.port}`);
       logger.info(`Dashboard: http://localhost:${server.port}/dashboard`);
       logger.info(`Admin: http://localhost:${server.port}/admin`);
+      logger.info(`Chat UI: http://localhost:${server.port}/chat`);
 
       setInterval(() => broadcastStats(server), 2000);
 
