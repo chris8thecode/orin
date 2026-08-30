@@ -10,7 +10,7 @@ import makeWASocket, {
 } from 'baileys';
 import P from 'pino';
 import { join } from 'path';
-import NodeCache from '@cacheable/node-cache';
+import { Cache } from '../utils/cache.js';
 import {
   addConnection,
   updateConnectionStatus,
@@ -37,9 +37,9 @@ import { broadcastStats, broadcastChatEvent } from '../server/websocket.js';
 const baileysLogger = logger.child({ component: 'baileys' });
 baileysLogger.level = 'trace';
 
-const msgRetryCounterCache = new NodeCache();
-const userDevicesCache = new NodeCache();
-const mediaCache = new NodeCache();
+const msgRetryCounterCache = new Cache();
+const userDevicesCache = new Cache();
+const mediaCache = new Cache();
 
 const activeSessions = new Map();
 

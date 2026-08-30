@@ -1,10 +1,10 @@
-import NodeCache from '@cacheable/node-cache';
+import { Cache } from '../utils/cache.js';
 import { config } from '../config.js';
 import { isGroupJid, isSameJid } from '../utils/helpers.js';
 import { getCommand } from './commands/index.js';
 import { handleAntiSpam } from './antiSpam.js';
 
-const groupCache = new NodeCache({ stdTTL: 5 * 60, useClones: false });
+const groupCache = new Cache({ stdTTL: 5 * 60, useClones: false });
 
 function getText(message) {
   return (
